@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>noa single-file demo — mobile + desktop</title>
+<style>
+  html,body{height:100%;margin:0;background:#0b1220;overflow:hidden;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+  #game { width:100%; height:100%; display:block; }
+  #hud { position:fixed; left:12px; top:12px; z-index:60; background:rgba(0,0,0,0.45); color:#fff; padding:8px 12px; border-radius:8px; font-family:monospace; font-size:13px; }
+  #hint { position:fixed; left:50%; transform:translateX(-50%); bottom:14px; z-index:60; color:#fff; background:rgba(0,0,0,0.36); padding:8px 12px; border-radius:8px; font-size:13px; }
+  /* mobile UI */
+  #controls-ui{position:fixed;left:0;right:0;bottom:0;display:flex;justify-content:space-between;padding:14px;z-index:55;pointer-events:none}
+  #joy-left{width:140px;height:140px;margin-left:12px;pointer-events:auto;touch-action:none;position:relative}
+  .joy-bg{width:100%;height:100%;background:rgba(255,255,255,0.04);border-radius:50%;border:1px solid rgba(255,255,255,0.08)}
+  .joy-knob{width:48px;height:48px;background:rgba(255,255,255,0.14);border-radius:50%;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);pointer-events:none;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px}
+  #right-controls{margin-right:12px;display:flex;flex-direction:column;gap:10px;pointer-events:none;align-items:flex-end}
+  #look-area{width:220px;height:140px;background:rgba(255,255,255,0.03);border-radius:12px;touch-action:none;pointer-events:auto;border:1px solid rgba(255,255,255,0.06)}
+  .action-row{display:flex;gap:10px;margin-top:6px;pointer-events:auto}
+  .btn{width:56px;height:56px;background:rgba(255,255,255,0.06);border-radius:12px;border:1px solid rgba(255,255,255,0.12);color:#fff;font-size:20px;display:flex;align-items:center;justify-content:center;user-select:none;touch-action:manipulation}
+  #hotbar{position:fixed;left:50%;transform:translateX(-50%);bottom:86px;z-index:57;display:flex;gap:8px;pointer-events:none}
+  .hotbar-slot{pointer-events:auto;width:56px;height:56px;background:rgba(0,0,0,0.45);border-radius:8px;border:2px solid rgba(255,255,255,0.08);display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;font-size:12px}
+  .hotbar-slot.selected{border-color:#ffd36b;box-shadow:0 0 8px rgba(255,211,107,0.25)}
+  @media (pointer:fine){#controls-ui{display:none}}
+  canvas{display:block}
+</style>
+</head>
+<body>
+  <div id="game"></div>
+  <div id="hud">Loading...</div>
+  <div id="hint">Desktop: click to lock pointer. WASD move, Space jump, Q break, E place. Mobile: left joystick move, right drag look, tap hotbar to select.</div>
+
+  <!-- Mobile controls -->
+  <div id="controls-ui" aria-hidden="true">
+    <div id="joy-left" aria-hidden="true"><div class="joy-bg"></div><div class="joy-knob" id="joy-knob">•</div></div>
+    <div id="right-controls" aria-hidden="true">
+      <div id="look-area" title="Drag here to look (mobile)"></div>
+      <div class="action-row">
+        <div class="btn" id="btn-break">⛏</div>
+        <div class="btn" id="btn-jump">⤴</div>
+        <div class="btn" id="btn-place">🧱</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="hotbar"></div>
+
+  <!-- Load noa from CDN. If needed, change path to a specific version on unpkg or jsdelivr. -->
+  <script src="https://unpkg.com/noa-engine/dist/noa.min.js"></script>
+  <!-- Fallback loader: if the above fails, show a clear error in HUD -->
+  <script>
+    if (!window.noa) {
+      document.getElementById('hud').innerText = 'Failed to load noa from CDN. If this happens, try npm build version or update CDN path in index.html.';
+      console.error('noa not found on window (CDN missing or path changed).');
+    }
+  </script>
+
+  <script>
+  (function () {
+    if (!window.noa) return; // bail if noa didn't load
+
+    // ---------- configuration ----------
+    const CELL = 1; // block size
+    const WORLD_W = 64, WORLD_H = 48, WORLD_D = 64; // our internal grid size for generation
+    const playerStart = [Math.floor(WORLD_W/2), WORLD_H - 6, Math.floor(WORLD_D/2)];
+
+    // block ids
+    const AIR = 0, DIRT = 1, STONE = 2, GRASS = 3, WOOD = 4, LEAVES = 5, SAND = 6;
+    const BLOCKS = {
+      1: { name: 'Dirt', color: 0x6c5b38 },
+      2: { name: 'Stone', color: 0x8b8b8b },
+      3: { name: 'Grass', color: 0x3ea033 },
+      4: { name: 'Wood', color: 0x8b5a2b },
+      5: { name: 'Leaves', color: 0x4ca04c },
+      6: { name: 'Sand', color: 0xe4d99b }
+    };
+
+    // inventory start
+    const inventory = { 1: 30, 2: 12, 3: 20, 4: 8, 5: 0, 6: 14 };
+    let selectedBlockId = 3;
+
+    // mobile joystick state
+    const joystick = { active: false, id: null, startX: 0, startY: 0, dx: 0, dy: 0 };
+    const MAX_JOY = 48, JOY_DEADZONE = 0.18;
+
+    // helpers for DOM
+    const hud = document.getElementById('hud');
+    const hotbarEl = document.getElementById('hotbar');
+    function rebuildHotbarUI(){
+      hotbarEl.innerHTML = '';
+      const keys = Object.keys(BLOCKS).map(x => parseInt(x));
+      for (let i=0;i<keys.length;i++){
+        const id = keys[i];
+        const slot = document.createElement('div');
+        slot.className = 'hotbar-slot' + (id === selectedBlockId ? ' selected' : '');
+        slot.dataset.bid = id;
+        slot.innerHTML = `<div style="width:26px;height:26px;border-radius:4px;background:#000;margin-bottom:6px;"></div>
+                          <div style="font-size:11px">${BLOCKS[id].name}</div>
+                          <div style="font-size:12px;margin-top:4px">${inventory[id] ?? 0}</div>`;
+        slot.addEventListener('click', ()=>{ selectedBlockId = id; rebuildHotbarUI(); });
+        slot.addEventListener('touchstart', (e)=>{ e.preventDefault(); selectedBlockId = id; rebuildHotbarUI(); }, {passive:false});
+        hotbarEl.appendChild(slot);
+      }
+    }
+
+    // ---------- create noa instance ----------
+    // Use a modest chunk size and small draw distances to keep it friendly for browsers/mobile.
+    const opts = {
+      container: document.getElementById('game'),
+      showFPS: false,
+      // chunk meshes will be 16*16*chunkY
+      chunkSize: 16,
+      // viewing distance in chunks
+      chunkAddDistance: 2,
+      chunkRemoveDistance: 3,
+      // initial position
+      playerStart: playerStart,
+      // optional: tweak webgl options
+      texturePath: '' // we won't rely on external block atlas in this simple bundle
+    };
+
+    const noa = window.noa(opts);
+
+    // NOTE: noa normally expects a texture atlas. For this single-file bundle we'll register simple colored block types
+    // by creating small THREE materials for each block and register a "block" with the engine using simple meshes on addBlock.
+    // We'll use noa.rendering.addMeshToScene for that purpose using onAddBlock callbacks.
+
+    // register a "basic" block type in noa that uses a colored cube for visual representation
+    // We'll store block data in noa.world and draw colored cubes ourselves when chunks update.
+
+    // create a simple rendering layer that manages colored block meshes per chunk (fallback approach)
+    // This is not full noa texture-atlas usage, but provides a working demo in one file.
+
+    // store geometry & material caches
+    const cubeGeom = new THREE.BoxGeometry(1,1,1);
+    const matCache = {};
+    function getMaterialFor(id){
+      if(matCache[id]) return matCache[id];
+      const color = BLOCKS[id] ? BLOCKS[id].color : 0xffffff;
+      const m = new THREE.MeshLambertMaterial({ color: color });
+      matCache[id] = m;
+      return m;
+    }
+
+    // We'll use noa.world for block storage (set/getBlock) and manage chunk meshes using simple instancing per chunk.
+    // Utility accessors
+    function setBlock(x,y,z, id) {
+      noa.world.setBlockID(x,y,z,id);
+    }
+    function getBlock(x,y,z){
+      return noa.world.getBlockID(x,y,z);
+    }
+
+    // generate terrain into noa.world
+    const w = WORLD_W, h = WORLD_H, d = WORLD_D;
+    // generate a height map with sin/cos + randomness, some trees and sand edges
+    const centerX = Math.floor(w/2), centerZ = Math.floor(d/2);
+    for(let x=0;x<w;x++){
+      for(let z=0;z<d;z++){
+        // normalized coords
+        const nx = x/w - 0.5, nz = z/d - 0.5;
+        const ridge = Math.sin(x*0.14) * Math.cos(z*0.09);
+        let height = Math.floor(5 + 6 * (0.5 + 0.5*ridge) + 3*Math.sin((x+z)*0.06) + Math.floor(2*Math.random()));
+        // edges -> beach
+        const distEdge = Math.min(x, z, w-1-x, d-1-z);
+        if(distEdge < 4) height = Math.max(1, 2 + Math.floor(Math.random()*2));
+        height = Math.min(height, h-4);
+        for(let y=0;y<height;y++){
+          if(distEdge < 4) setBlock(x,y,z, SAND);
+          else if(y < height-2) setBlock(x,y,z, STONE);
+          else if(y < height-1) setBlock(x,y,z, DIRT);
+          else setBlock(x,y,z, GRASS);
+        }
+        // small chance to add tree on grass
+        if(height > 3 && Math.random() < 0.03 && distEdge >= 6){
+          const trunkH = 3 + Math.floor(Math.random()*2);
+          for(let ty=height; ty<height+trunkH && ty < h-2; ty++) setBlock(x,ty,z, WOOD);
+          const ly = Math.min(height+trunkH, h-2);
+          for(let ix=-2; ix<=2; ix++){
+            for(let iz=-2; iz<=2; iz++){
+              for(let iy=0; iy<=1; iy++){
+                const lx = x+ix, lz = z+iz, lypos = ly + iy;
+                if(lx>=0 && lx<w && lz>=0 && lz<d && lypos>=0 && lypos<h){
+                  if(Math.abs(ix)+Math.abs(iz) <= 4){
+                    if(getBlock(lx, lypos, lz) === AIR) setBlock(lx, lypos, lz, LEAVES);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Build a simple chunk visualizer:
+    // When noa chunk updates we create a THREE.InstancedMesh for that chunk's filled blocks.
+    // Keep a map from chunkKey -> { mesh, count }
+    const chunkMeshes = new Map();
+
+    function chunkKey(cx,cy,cz){ return cx+','+cy+','+cz; }
+
+    function buildChunkMesh(cx, cy, cz){
+      // iterate over blocks in chunk and build instanced mesh
+      const size = noa.world._chunkSize; // may be 16 by default
+      const xs = cx*size, ys = cy*size, zs = cz*size;
+      let count = 0;
+      const entries = [];
+      for(let x=0;x<size;x++){
+        for(let y=0;y<size;y++){
+          for(let z=0;z<size;z++){
+            const wx = xs + x, wy = ys + y, wz = zs + z;
+            const bid = getBlock(wx, wy, wz);
+            if(bid && bid !== AIR){
+              entries.push({ x: wx, y: wy, z: wz, bid });
+              count++;
+            }
+          }
+        }
+      }
+      if(count === 0) return null;
+      // create instanced mesh: group by block type to reduce draw calls
+      const group = new THREE.Group();
+      const tmpMat4 = new THREE.Matrix4();
+      const color = new THREE.Color();
+      // For each block type create an InstancedMesh
+      const byType = entries.reduce((acc, e) => { (acc[e.bid] = acc[e.bid] || []).push(e); return acc; }, {});
+      Object.keys(byType).forEach(bidStr => {
+        const bid = parseInt(bidStr);
+        const list = byType[bid];
+        const mat = getMaterialFor(bid);
+        const inst = new THREE.InstancedMesh(cubeGeom, mat, list.length);
+        inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        for(let i=0;i<list.length;i++){
+          const e = list[i];
+          tmpMat4.makeTranslation(e.x + 0.5, e.y + 0.5, e.z + 0.5);
+          inst.setMatrixAt(i, tmpMat4);
+        }
+        inst.count = list.length;
+        group.add(inst);
+      });
+      return { group, count };
+    }
+
+    // hook into noa's chunk add/remove events if they exist, otherwise build a simple initial mesh covering the region we used
+    // Some noa builds expose events via noa.world.on('chunkLoaded', fn) — but to keep compatibility we will create an initial visualization
+    // using the limits we generated above; noa will still manage its own chunk system for collisions.
+    (function createInitialVisuals(){
+      // compute bounds used above and create meshes for those world coords by chunk size
+      const chunkSize = noa.world._chunkSize || 16;
+      const cx0 = 0, cz0 = 0, cy0 = 0;
+      const cx1 = Math.ceil(WORLD_W / chunkSize);
+      const cz1 = Math.ceil(WORLD_D / chunkSize);
+      const cy1 = Math.ceil(WORLD_H / chunkSize);
+      for(let cx = cx0; cx < cx1; cx++){
+        for(let cy = cy0; cy < cy1; cy++){
+          for(let cz = cz0; cz < cz1; cz++){
+            const key = chunkKey(cx,cy,cz);
+            const info = buildChunkMesh(cx,cy,cz);
+            if(info){
+              chunkMeshes.set(key, info);
+              noa.rendering.addMeshToScene(info.group);
+            }
+          }
+        }
+      }
+    })();
+
+    // --- player / controls ---
+    // use noa's built-in player entity
+    // define simple player behaviour using noa.ents
+    const playerEnt = noa.ents.add('player', {
+      width: 0.6,
+      height: 1.8,
+      position: playerStart,
+      canSleep: false,
+      // we won't add a visual model for the player — camera is attached to player entity by noa by default
+    });
+
+    // attach camera to player
+    // (noa already manages camera following; ensure camera is positioned)
+    noa.camera.setPosition(playerStart[0], playerStart[1] + 1.6, playerStart[2]);
+
+    // pointer-lock & mouse look (desktop)
+    document.addEventListener('click', ()=> {
+      if(window.matchMedia && window.matchMedia('(pointer: fine)').matches){
+        const el = document.body;
+        if(el.requestPointerLock) el.requestPointerLock();
+      }
+    });
+    document.addEventListener('pointerlockchange', ()=> {
+      // noa has its own mouse look controls; if not, basic orientation changes below would work
+    });
+
+    // keyboard controls mapping
+    const currentInput = { fw:0, bk:0, lt:0, rt:0, jump:false, place:false, break:false, run:false };
+    window.addEventListener('keydown', e=>{
+      if(e.code==='KeyW') currentInput.fw = 1;
+      if(e.code==='KeyS') currentInput.bk = 1;
+      if(e.code==='KeyA') currentInput.lt = 1;
+      if(e.code==='KeyD') currentInput.rt = 1;
+      if(e.code==='Space') currentInput.jump = true;
+      if(e.code==='ShiftLeft' || e.code==='ShiftRight') currentInput.run = true;
+      if(e.code==='KeyE') currentInput.place = true;
+      if(e.code==='KeyQ') currentInput.break = true;
+      // hotbar number keys
+      if(e.key >= '1' && e.key <= '9'){
+        const n = parseInt(e.key);
+        const keys = Object.keys(BLOCKS).map(x=>parseInt(x));
+        if(n-1 < keys.length){ selectedBlockId = keys[n-1]; rebuildHotbarUI(); }
+      }
+    });
+    window.addEventListener('keyup', e=>{
+      if(e.code==='KeyW') currentInput.fw = 0;
+      if(e.code==='KeyS') currentInput.bk = 0;
+      if(e.code==='KeyA') currentInput.lt = 0;
+      if(e.code==='KeyD') currentInput.rt = 0;
+      if(e.code==='Space') currentInput.jump = false;
+      if(e.code==='ShiftLeft' || e.code==='ShiftRight') currentInput.run = false;
+      if(e.code==='KeyE') currentInput.place = false;
+      if(e.code==='KeyQ') currentInput.break = false;
+    });
+
+    // Mobile UI wiring
+    const joyLeft = document.getElementById('joy-left');
+    const joyKnob = document.getElementById('joy-knob');
+    const lookArea = document.getElementById('look-area');
+    const btnPlace = document.getElementById('btn-place');
+    const btnBreak = document.getElementById('btn-break');
+    const btnJump = document.getElementById('btn-jump');
+
+    function updateKnob(){ if(!joyKnob || !joyLeft) return; const w = joyLeft.clientWidth, h = joyLeft.clientHeight; joyKnob.style.left = (50 + joystick.dx / w * 100) + '%'; joyKnob.style.top = (50 + joystick.dy / h * 100) + '%'; }
+
+    if(joyLeft){
+      joyLeft.addEventListener('touchstart', e=>{ e.preventDefault(); const t = e.changedTouches[0]; joystick.active = true; joystick.id = t.identifier; const rect = joyLeft.getBoundingClientRect(); joystick.startX = rect.left + rect.width/2; joystick.startY = rect.top + rect.height/2; joystick.dx = joystick.dy = 0; updateKnob(); }, {passive:false});
+      joyLeft.addEventListener('touchmove', e=>{ if(!joystick.active) return; for(const t of Array.from(e.changedTouches)){ if(t.identifier === joystick.id){ joystick.dx = t.clientX - joystick.startX; joystick.dy = t.clientY - joystick.startY; const dist = Math.hypot(joystick.dx, joystick.dy); if(dist > MAX_JOY){ const s = MAX_JOY / dist; joystick.dx *= s; joystick.dy *= s; } updateKnob(); e.preventDefault(); return; } } }, {passive:false});
+      joyLeft.addEventListener('touchend', e=>{ for(const t of Array.from(e.changedTouches)){ if(t.identifier === joystick.id){ joystick.active = false; joystick.id = null; joystick.dx = joystick.dy = 0; updateKnob(); e.preventDefault(); return; } } }, {passive:false});
+    }
+
+    // mobile look area: translate drags into camera yaw/pitch using noa.camera or noa.ents
+    let lookTouchId = null, lastLookX = 0, lastLookY = 0;
+    if(lookArea){
+      lookArea.addEventListener('touchstart', e=>{ const t = e.changedTouches[0]; lookTouchId = t.identifier; lastLookX = t.clientX; lastLookY = t.clientY; }, {passive:true});
+      lookArea.addEventListener('touchmove', e=>{ if(lookTouchId === null) return; for(const t of Array.from(e.changedTouches)){ if(t.identifier === lookTouchId){ const dx = t.clientX - lastLookX, dy = t.clientY - lastLookY; noa.camera.rotateYaw(-dx * 0.0035); noa.camera.rotatePitch(-dy * 0.0035); lastLookX = t.clientX; lastLookY = t.clientY; e.preventDefault(); return; } } }, {passive:false});
+      lookArea.addEventListener('touchend', e=>{ for(const t of Array.from(e.changedTouches)){ if(t.identifier === lookTouchId){ lookTouchId = null; e.preventDefault(); return; } } }, {passive:false});
+    }
+
+    if(btnPlace){ btnPlace.addEventListener('touchstart', e=>{ e.preventDefault(); currentInput.place = true; }, {passive:false}); btnPlace.addEventListener('touchend', e=>{ currentInput.place = false; }, {passive:true}); }
+    if(btnBreak){ btnBreak.addEventListener('touchstart', e=>{ e.preventDefault(); currentInput.break = true; }, {passive:false}); btnBreak.addEventListener('touchend', e=>{ currentInput.break = false; }, {passive:true}); }
+    if(btnJump){ btnJump.addEventListener('touchstart', e=>{ e.preventDefault(); currentInput.jump = true; }, {passive:false}); btnJump.addEventListener('touchend', e=>{ currentInput.jump = false; }, {passive:true}); }
+
+    // utility: raycast from camera center to find block and face
+    function getBlockTarget(){
+      const origin = noa.camera.getPosition(); // [x,y,z]
+      const dir = noa.camera.getDirection(); // [x,y,z]
+      const maxDist = 8;
+      // step along the ray: sampling small increments to detect block hit
+      const step = 0.15;
+      const pos = [ origin[0], origin[1], origin[2] ];
+      for(let t=0; t<maxDist; t+=step){
+        pos[0] += dir[0]*step;
+        pos[1] += dir[1]*step;
+        pos[2] += dir[2]*step;
+        const bx = Math.floor(pos[0]), by = Math.floor(pos[1]), bz = Math.floor(pos[2]);
+        if(bx < 0 || by < 0 || bz < 0 || bx >= w || by >= h || bz >= d) continue;
+        const bid = getBlock(bx,by,bz);
+        if(bid && bid !== AIR){
+          // compute face normal approx by checking which axis difference from previous step crosses into this block
+          // for simplicity, compute target (where to place) as previous position floor
+          const prevX = Math.floor(pos[0] - dir[0]*step), prevY = Math.floor(pos[1] - dir[1]*step), prevZ = Math.floor(pos[2] - dir[2]*step);
+          return { block:{x:bx,y:by,z:bz}, target:{x:prevX,y:prevY,z:prevZ} };
+        }
+      }
+      return null;
+    }
+
+    // Prevent placing blocks inside the player's AABB
+    function isBlockOverlappingPlayer(tx,ty,tz){
+      const px = noa.camera.getPosition()[0], py = noa.camera.getPosition()[1], pz = noa.camera.getPosition()[2];
+      const halfWidth = 0.35;
+      const playerMin = { x: px - halfWidth, y: py - 1.6, z: pz - halfWidth };
+      const playerMax = { x: px + halfWidth, y: py, z: pz + halfWidth };
+      const blockMin = { x: tx, y: ty, z: tz };
+      const blockMax = { x: tx + 1, y: ty + 1, z: tz + 1 };
+      return (playerMin.x < blockMax.x && playerMax.x > blockMin.x) &&
+             (playerMin.y < blockMax.y && playerMax.y > blockMin.y) &&
+             (playerMin.z < blockMax.z && playerMax.z > blockMin.z);
+    }
+
+    // Place/break cooldown
+    let placeCooldown = 0, breakCooldown = 0, lastTime = performance.now();
+    const COOLDOWN = 200;
+
+    // main tick
+    noa.on('tick', function(dt){
+      const now = performance.now();
+      const deltaMs = now - lastTime;
+      lastTime = now;
+      placeCooldown = Math.max(0, placeCooldown - deltaMs);
+      breakCooldown = Math.max(0, breakCooldown - deltaMs);
+
+      // movement from input and joystick
+      let joyX = 0, joyY = 0;
+      if(joystick.active){ joyX = joystick.dx / MAX_JOY; joyY = -joystick.dy / MAX_JOY; if(Math.abs(joyX) < JOY_DEADZONE) joyX = 0; if(Math.abs(joyY) < JOY_DEADZONE) joyY = 0; }
+      const forward = joyY !== 0 ? joyY : (currentInput.fw ? 1 : (currentInput.bk ? -1 : 0));
+      const strafe  = joyX !== 0 ? joyX : (currentInput.rt ? 1 : (currentInput.lt ? -1 : 0));
+      const run = currentInput.run ? 1.8 : 1.0;
+      // noa's default player controller expects input via "noa.inputs" methods; for simplicity, call player's movement functions
+      noa.inputs.state.forward = forward;
+      noa.inputs.state.side = strafe;
+      noa.inputs.state.jump = currentInput.jump;
+
+      // update noa's internal engine (handled by noa)
+      // place/break interactions (debounced)
+      if(currentInput.break && breakCooldown <= 0){
+        const tgt = getBlockTarget();
+        if(tgt){
+          const bx = tgt.block.x, by = tgt.block.y, bz = tgt.block.z;
+          const bid = getBlock(bx,by,bz);
+          if(bid && bid !== AIR){
+            setBlock(bx,by,bz, AIR);
+            // update visuals: rebuild the chunk mesh containing bx,by,bz if exists
+            const cx = Math.floor(bx / (noa.world._chunkSize || 16));
+            const cy = Math.floor(by / (noa.world._chunkSize || 16));
+            const cz = Math.floor(bz / (noa.world._chunkSize || 16));
+            const key = chunkKey(cx,cy,cz);
+            const info = chunkMeshes.get(key);
+            if(info){
+              noa.rendering.removeMeshFromScene(info.group);
+              chunkMeshes.delete(key);
+              const rebuilt = buildChunkMesh(cx,cy,cz);
+              if(rebuilt){ chunkMeshes.set(key, rebuilt); noa.rendering.addMeshToScene(rebuilt.group); }
+            }
+            // add to inventory
+            inventory[bid] = (inventory[bid] || 0) + 1;
+            rebuildHotbarUI();
+            breakCooldown = COOLDOWN;
+          }
+        }
+        currentInput.break = false;
+      }
+
+      if(currentInput.place && placeCooldown <= 0){
+        const tgt = getBlockTarget();
+        if(tgt){
+          const tx = tgt.target.x, ty = tgt.target.y, tz = tgt.target.z;
+          if(tx >=0 && ty >=0 && tz >=0 && tx < w && ty < h && tz < d && getBlock(tx,ty,tz) === AIR){
+            // check not overlapping player
+            if(!isBlockOverlappingPlayer(tx,ty,tz) && (inventory[selectedBlockId] || 0) > 0){
+              setBlock(tx,ty,tz, selectedBlockId);
+              // rebuild chunk mesh
+              const cx = Math.floor(tx / (noa.world._chunkSize || 16));
+              const cy = Math.floor(ty / (noa.world._chunkSize || 16));
+              const cz = Math.floor(tz / (noa.world._chunkSize || 16));
+              const key = chunkKey(cx,cy,cz);
+              const info = chunkMeshes.get(key);
+              if(info){
+                noa.rendering.removeMeshFromScene(info.group);
+                chunkMeshes.delete(key);
+              }
+              const rebuilt = buildChunkMesh(cx,cy,cz);
+              if(rebuilt){ chunkMeshes.set(key, rebuilt); noa.rendering.addMeshToScene(rebuilt.group); }
+              inventory[selectedBlockId] = (inventory[selectedBlockId] || 0) - 1;
+              rebuildHotbarUI();
+              placeCooldown = COOLDOWN;
+            }
+          }
+        }
+        currentInput.place = false;
+      }
+      // update HUD
+      const camPos = noa.camera.getPosition();
+      hud.innerHTML = `Pos: ${camPos[0].toFixed(2)}, ${camPos[1].toFixed(2)}, ${camPos[2].toFixed(2)}<br>
+                       Selected: ${BLOCKS[selectedBlockId].name} (${inventory[selectedBlockId]||0})<br>
+                       Blocks visible: ${[...chunkMeshes.values()].reduce((s,i)=>s+i.count,0)}`;
+    });
+
+    // initialize UI
+    rebuildHotbarUI();
+
+    // basic joystick rendering update (keeps knob centered when not active)
+    (function keepKnobCentered(){
+      updateKnob();
+      requestAnimationFrame(keepKnobCentered);
+    })();
+
+    // expose basic console guidance
+    console.log('noa single-file demo loaded. If something is broken, check the console and CDN path for noa (unpkg).');
+
+  })();
+  </script>
+</body>
+</html>
