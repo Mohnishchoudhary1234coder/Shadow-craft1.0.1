@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Single-file Voxel Game — Desktop + Mobile</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <style>
+    html,body { height:100%; margin:0; background:#111; overflow:hidden; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; -webkit-user-select:none; user-select:none; touch-action:none; }
+    #hud {
+      position:fixed; left:12px; top:12px; z-index:40;
+      background:rgba(0,0,0,0.45); color:#fff; padding:10px 12px; border-radius:8px;
+      font-family: monospace; font-size:13px;
+      max-width:50%;
+    }
+    #hint {
+      position:fixed; left:50%; transform:translateX(-50%); bottom:14px; z-index:40;
+      color:#fff; background:rgba(0,0,0,0.35); padding:8px 12px; border-radius:8px; font-size:13px;
+    }
+
+    /* Mobile controls container */
+    #controls-ui {
+      position:fixed; left:0; right:0; bottom:0; display:flex; justify-content:space-between; padding:12px;
+      z-index:35; pointer-events:none;
+    }
+    /* joystick (left) */
+    #joy-left {
+      width:140px; height:140px; margin-left:12px; pointer-events:auto;
+      touch-action:none; position:relative;
+    }
+    .joy-bg {
+      width:100%; height:100%; background:rgba(255,255,255,0.04); border-radius:50%;
+      border:1px solid rgba(255,255,255,0.08); display:flex; align-items:center; justify-content:center;
+    }
+    .joy-knob {
+      width:48px; height:48px; background:rgba(255,255,255,0.14); border-radius:50%;
+      transform:translate(-50%,-50%); position:absolute; left:50%; top:50%; pointer-events:none;
+      display:flex; align-items:center; justify-content:center; color:#fff; font-size:14px;
+    }
+
+    /* right area: look + action buttons */
+    #right-controls { margin-right:12px; display:flex; flex-direction:column; gap:10px; pointer-events:none; align-items:flex-end; }
+    #look-area {
+      width:220px; height:140px; background:rgba(255,255,255,0.03); border-radius:12px;
+      touch-action:none; pointer-events:auto; position:relative; border:1px solid rgba(255,255,255,0.06);
+    }
+    .action-row { display:flex; gap:10px; margin-top:6px; pointer-events:auto; }
+    .btn {
+      width:56px; height:56px; background:rgba(255,255,255,0.06); border-radius:12px;
+      border:1px solid rgba(255,255,255,0.12); color:#fff; font-size:18px; display:flex;
+      align-items:center; justify-content:center; user-select:none; touch-action:manipulation;
+    }
+
+    /* hide mobile UI on pointer: fine (i.e. desktops) but allow optional toggle */
+    @media (pointer: fine) {
+      #controls-ui { display:none; }
+    }
+
+    /* small screen adjustments */
+    @media (max-width:420px) {
+      #hud { font-size:12px; max-width:70%; }
+      #look-area { width:160px; height:120px; }
+      #joy-left { width:110px; height:110px; }
+    }
+
+    canvas { display:block; }
+    a.small { color:#88c; text-decoration:none; margin-left:8px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div id="hud">Loading...</div>
+  <div id="hint">Click to lock pointer (desktop). Use left joystick to move and right area to look on mobile. Tap place/break buttons.</div>
+
+  <div id="controls-ui">
+    <div id="joy-left" aria-hidden="true">
+      <div class="joy-bg"></div>
+      <div class="joy-knob" id="joy-knob">•</div>
+    </div>
+
+    <div id="right-controls" aria-hidden="true">
+      <div id="look-area" title="Drag here to look (mobile)"></div>
+      <div class="action-row">
+        <div class="btn" id="btn-break">⛏</div>
+        <div class="btn" id="btn-jump">⤴</div>
+        <div class="btn" id="btn-place">🧱</div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    // Single-file voxel game with proper mobile & desktop controls.
+    // Uses Three.js via CDN.
+    import * as THREE from 'https://unpkg.com/three@0.154.0/build/three.module.js';
+
+    // ---------- Config ----------
+    const WORLD_W = 48, WORLD_H = 30, WORLD_D = 48;
+    const BLOCK_AIR = 0, BLOCK_DIRT = 1;
+    const PLAYER_EYE = 1.6;
+    const JOY_DEADZONE = 0.18; // joystick deadzone
+    const MAX_JOY = 48; // px knob travel
+
+    // ---------- Utility ----------
+    function idx(x,y,z,w,d){ return x + w*(z + d*y); }
+
+    // ---------- VoxelWorld (instanced mesh) ----------
+    class VoxelWorld {
+      constructor(w,h,d, scene) {
+        this.w = w; this.h = h; this.d = d;
+        this.size = w*h*d;
+        this.blocks = new Uint8Array(this.size).fill(0);
+        this.instanceIdToCoord = [];
+        this.mesh = null;
+        this._maxInstances = this.size;
+        this._buildMaterialAndMesh();
+        this.generateTerrain();
+        this.updateMesh();
+        if(scene) scene.add(this.mesh);
+      }
+      _buildMaterialAndMesh(){
+        const box = new THREE.BoxGeometry(1,1,1);
+        // simple multi-color technique (just one color for now)
+        const mat = new THREE.MeshLambertMaterial({ color: 0x6cbb47 });
+        this.mesh = new THREE.InstancedMesh(box, mat, this._maxInstances);
+        this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        this.mesh.castShadow = false;
+        this.mesh.receiveShadow = false;
+      }
+      generateTerrain() {
+        for(let x=0;x<this.w;++x){
+          for(let z=0;z<this.d;++z){
+            const h = 2 + Math.floor(3 * (0.5 + 0.5*Math.sin(x*0.18) + 0.5*Math.cos(z*0.15)));
+            for(let y=0;y<h && y<this.h;++y){
+              this.set(x,y,z,BLOCK_DIRT);
+            }
+          }
+        }
+      }
+      inBounds(x,y,z){
+        return x>=0 && y>=0 && z>=0 && x<this.w && y<this.h && z<this.d;
+      }
+      get(x,y,z){
+        if(!this.inBounds(x,y,z)) return BLOCK_AIR;
+        return this.blocks[idx(x,y,z,this.w,this.d)];
+      }
+      set(x,y,z, val){
+        if(!this.inBounds(x,y,z)) return;
+        this.blocks[idx(x,y,z,this.w,this.d)] = val;
+      }
+      updateMesh(){
+        const tmpMat = new THREE.Matrix4();
+        let i = 0;
+        this.instanceIdToCoord.length = 0;
+        for(let x=0;x<this.w;++x){
+          for(let y=0;y<this.h;++y){
+            for(let z=0;z<this.d;++z){
+              if(this.get(x,y,z) !== BLOCK_AIR){
+                tmpMat.makeTranslation(x+0.5, y+0.5, z+0.5);
+                this.mesh.setMatrixAt(i, tmpMat);
+                this.instanceIdToCoord[i] = {x,y,z};
+                i++;
+              }
+            }
+          }
+        }
+        this.mesh.count = i;
+        this.mesh.instanceMatrix.needsUpdate = true;
+        this.mesh.frustumCulled = false;
+      }
+    }
+
+    // ---------- Input & Joystick ----------
+    const inputState = {
+      fw:0, lt:0, rt:0, bk:0, run:false, jump:false,
+      place:false, break:false,
+      pointerLocked:false
+    };
+
+    // joystick state
+    const joystick = {
+      active: false,
+      id: null,
+      startX: 0, startY: 0,
+      dx: 0, dy: 0
+    };
+
+    function setupControls(player, camera) {
+      // pointer lock only for desktop (pointer: fine)
+      document.addEventListener('click', ()=> {
+        // request pointer lock only on non-touch large devices; don't force on mobile
+        if(window.matchMedia && window.matchMedia('(pointer: fine)').matches){
+          document.body.requestPointerLock?.();
+        }
+      });
+      document.addEventListener('pointerlockchange', ()=> {
+        inputState.pointerLocked = (document.pointerLockElement === document.body);
+        if(inputState.pointerLocked){
+          window.addEventListener('mousemove', onMouseMove);
+        } else {
+          window.removeEventListener('mousemove', onMouseMove);
+        }
+      });
+      function onMouseMove(e){
+        player.yaw   -= e.movementX * 0.0025;
+        player.pitch -= e.movementY * 0.0025;
+        player.pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, player.pitch));
+      }
+
+      // keyboard
+      window.addEventListener('keydown', e=>{
+        if(e.code==='KeyW') inputState.fw = 1;
+        if(e.code==='KeyS') inputState.bk = 1;
+        if(e.code==='KeyA') inputState.lt = 1;
+        if(e.code==='KeyD') inputState.rt = 1;
+        if(e.code==='ShiftLeft' || e.code==='ShiftRight') inputState.run = true;
+        if(e.code==='Space') inputState.jump = true;
+        if(e.code==='KeyE') inputState.place = true;
+        if(e.code==='KeyQ') inputState.break = true;
+      });
+      window.addEventListener('keyup', e=>{
+        if(e.code==='KeyW') inputState.fw = 0;
+        if(e.code==='KeyS') inputState.bk = 0;
+        if(e.code==='KeyA') inputState.lt = 0;
+        if(e.code==='KeyD') inputState.rt = 0;
+        if(e.code==='ShiftLeft' || e.code==='ShiftRight') inputState.run = false;
+        if(e.code==='Space') inputState.jump = false;
+        if(e.code==='KeyE') inputState.place = false;
+        if(e.code==='KeyQ') inputState.break = false;
+      });
+
+      // Mobile UI elements
+      const joyLeft = document.getElementById('joy-left');
+      const joyKnob = document.getElementById('joy-knob');
+      const lookArea = document.getElementById('look-area');
+      const btnPlace = document.getElementById('btn-place');
+      const btnBreak = document.getElementById('btn-break');
+      const btnJump  = document.getElementById('btn-jump');
+
+      // Joystick touch handling (left control)
+      joyLeft.addEventListener('touchstart', (e)=>{
+        e.preventDefault();
+        const t = e.changedTouches[0];
+        joystick.active = true;
+        joystick.id = t.identifier;
+        const rect = joyLeft.getBoundingClientRect();
+        joystick.startX = rect.left + rect.width/2;
+        joystick.startY = rect.top + rect.height/2;
+        joystick.dx = joystick.dy = 0;
+        updateKnob();
+      }, {passive:false});
+
+      joyLeft.addEventListener('touchmove', (e)=>{
+        if(!joystick.active) return;
+        for(const t of Array.from(e.changedTouches)){
+          if(t.identifier === joystick.id){
+            const tx = t.clientX, ty = t.clientY;
+            joystick.dx = tx - joystick.startX;
+            joystick.dy = ty - joystick.startY;
+            // clamp knob to max distance
+            const dist = Math.hypot(joystick.dx, joystick.dy);
+            if(dist > MAX_JOY){
+              const s = MAX_JOY / dist;
+              joystick.dx *= s; joystick.dy *= s;
+            }
+            updateKnob();
+            e.preventDefault();
+            return;
+          }
+        }
+      }, {passive:false});
+
+      joyLeft.addEventListener('touchend', (e)=>{
+        for(const t of Array.from(e.changedTouches)){
+          if(t.identifier === joystick.id){
+            joystick.active = false; joystick.id = null;
+            joystick.dx = joystick.dy = 0;
+            updateKnob();
+            e.preventDefault();
+            return;
+          }
+        }
+      }, {passive:false});
+
+      function updateKnob(){
+        joyKnob.style.left = (50 + joystick.dx / joyLeft.clientWidth * 100) + '%';
+        joyKnob.style.top  = (50 + joystick.dy / joyLeft.clientHeight * 100) + '%';
+      }
+
+      // Look area: dragging rotates camera on mobile when pointer not locked
+      let lookTouchId = null;
+      let lastLookX = 0, lastLookY = 0;
+      lookArea.addEventListener('touchstart', (e)=>{
+        const t = e.changedTouches[0];
+        lookTouchId = t.identifier;
+        lastLookX = t.clientX; lastLookY = t.clientY;
+      }, {passive:true});
+      lookArea.addEventListener('touchmove', (e)=>{
+        if(lookTouchId === null) return;
+        for(const t of Array.from(e.changedTouches)){
+          if(t.identifier === lookTouchId){
+            const dx = t.clientX - lastLookX;
+            const dy = t.clientY - lastLookY;
+            player.yaw   -= dx * 0.0035;
+            player.pitch -= dy * 0.0035;
+            player.pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, player.pitch));
+            lastLookX = t.clientX; lastLookY = t.clientY;
+            e.preventDefault();
+            return;
+          }
+        }
+      }, {passive:false});
+      lookArea.addEventListener('touchend', (e)=>{
+        for(const t of Array.from(e.changedTouches)){
+          if(t.identifier === lookTouchId){
+            lookTouchId = null;
+            e.preventDefault();
+            return;
+          }
+        }
+      }, {passive:false});
+
+      // action buttons
+      if(btnPlace){
+        btnPlace.addEventListener('touchstart', e=>{ e.preventDefault(); inputState.place = true; }, {passive:false});
+        btnPlace.addEventListener('touchend',   e=>{ inputState.place = false; }, {passive:true});
+      }
+      if(btnBreak){
+        btnBreak.addEventListener('touchstart', e=>{ e.preventDefault(); inputState.break = true; }, {passive:false});
+        btnBreak.addEventListener('touchend',   e=>{ inputState.break = false; }, {passive:true});
+      }
+      if(btnJump){
+        btnJump.addEventListener('touchstart', e=>{ e.preventDefault(); inputState.jump = true; }, {passive:false});
+        btnJump.addEventListener('touchend',   e=>{ inputState.jump = false; }, {passive:true});
+      }
+    }
+
+    // ---------- Three.js bootstrap ----------
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB);
+
+    const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 1000);
+
+    // Lighting
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+    sun.position.set(10, 30, 10);
+    scene.add(sun);
+
+    // World
+    const world = new VoxelWorld(WORLD_W, WORLD_H, WORLD_D, scene);
+
+    // Player
+    const player = {
+      pos: new THREE.Vector3(Math.floor(WORLD_W/2)+0.5, WORLD_H + PLAYER_EYE - 2, Math.floor(WORLD_D/2)+0.5),
+      velocity: new THREE.Vector3(),
+      yaw: 0, pitch: 0,
+      speed: 4.0, jumpVel: 6.0, onGround: false
+    };
+
+    // Controls
+    setupControls(player, camera);
+
+    // Raycaster for interactions
+    const raycaster = new THREE.Raycaster();
+
+    function getBlockTarget(){
+      camera.updateMatrixWorld();
+      // always raycast from center of screen
+      raycaster.setFromCamera({x:0,y:0}, camera);
+      const intersects = raycaster.intersectObject(world.mesh, true);
+      if(intersects.length === 0) return null;
+      const it = intersects[0];
+      const iid = it.instanceId;
+      if(iid === undefined || iid === null){
+        // fallback: compute via point & normal
+        const p = it.point.clone();
+        const f = it.face.normal.clone();
+        const block = p.clone().addScaledVector(f, -0.5).floor();
+        const target = p.clone().addScaledVector(f, 0.5).floor();
+        return { block:{x:block.x,y:block.y,z:block.z}, target:{x:target.x,y:target.y,z:target.z}, face:f };
+      } else {
+        const block = world.instanceIdToCoord[iid];
+        const fn = it.face.normal;
+        const fx = Math.round(fn.x), fy = Math.round(fn.y), fz = Math.round(fn.z);
+        const target = { x: block.x + fx, y: block.y + fy, z: block.z + fz };
+        return { block: {x:block.x,y:block.y,z:block.z}, target, face: new THREE.Vector3(fx,fy,fz) };
+      }
+    }
+
+    // HUD
+    const hud = document.getElementById('hud');
+    function updateHUD(){
+      hud.innerHTML =
+        `Pos: ${player.pos.x.toFixed(2)}, ${player.pos.y.toFixed(2)}, ${player.pos.z.toFixed(2)}<br>` +
+        `OnGround: ${player.onGround ? 'YES' : 'NO'}<br>` +
+        `Yaw/Pitch: ${(player.yaw*57.2958).toFixed(1)}, ${(player.pitch*57.2958).toFixed(1)}<br>` +
+        `Blocks: ${world.mesh.count}<br>` +
+        `<small>Mobile: left joystick move, right drag look. Desktop: pointer-lock mouse look + WASD.</small>`;
+    }
+
+    // Resize
+    window.addEventListener('resize', ()=>{
+      camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }, false);
+
+    // Collision helper (very simple)
+    function collisionAt(pos){
+      const x = Math.floor(pos.x), y = Math.floor(pos.y - 0.001), z = Math.floor(pos.z);
+      return world.get(x,y,z) !== BLOCK_AIR;
+    }
+
+    // Main animation loop
+    let lastTime = performance.now();
+    function animate(now){
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+
+      // Read joystick values and map to input
+      let joyX = 0, joyY = 0;
+      if(joystick.active){
+        joyX = joystick.dx / MAX_JOY;
+        joyY = -joystick.dy / MAX_JOY;
+        // deadzone
+        if(Math.abs(joyX) < JOY_DEADZONE) joyX = 0;
+        if(Math.abs(joyY) < JOY_DEADZONE) joyY = 0;
+      }
+      // Keyboard fallback: map to fw/lt/rt/bk aggregated
+      const kbForward = inputState.fw ? 1 : (inputState.bk ? -1 : 0);
+      const kbStrafe  = inputState.rt ? 1 : (inputState.lt ? -1 : 0);
+
+      // build final move vector (joystick has priority when active)
+      let forward = joyY !== 0 ? joyY : kbForward;
+      let strafe  = joyX !== 0 ? joyX : kbStrafe;
+
+      const run = inputState.run;
+      const speed = player.speed * (run ? 1.8 : 1.0);
+
+      // orientation
+      const yaw = player.yaw;
+      const sinY = Math.sin(yaw), cosY = Math.cos(yaw);
+
+      let mvx = 0, mvz = 0;
+      if(Math.abs(forward) > 0 || Math.abs(strafe) > 0){
+        // combine forward & strafe in world space
+        mvx = (strafe) * cosY + (forward) * sinY;
+        mvz = (strafe) * -sinY + (forward) * cosY;
+        const len = Math.hypot(mvx, mvz) || 1;
+        mvx = (mvx / len) * speed;
+        mvz = (mvz / len) * speed;
+      }
+
+      player.velocity.x = mvx;
+      player.velocity.z = mvz;
+      // gravity
+      player.velocity.y -= 12.0 * dt;
+
+      // Ground check
+      const footPos = player.pos.clone(); footPos.y -= 0.2;
+      player.onGround = collisionAt(footPos);
+      if(player.onGround && player.velocity.y < 0) player.velocity.y = 0;
+      if(player.onGround && inputState.jump){
+        player.velocity.y = player.jumpVel;
+        player.onGround = false;
+      }
+
+      // Integrate with simple axis collisions
+      let nextPos = player.pos.clone();
+
+      // X
+      nextPos.x += player.velocity.x * dt;
+      if(!collisionAt(new THREE.Vector3(nextPos.x, player.pos.y, player.pos.z))){
+        player.pos.x = nextPos.x;
+      } else {
+        player.velocity.x = 0;
+      }
+      // Y
+      nextPos.y += player.velocity.y * dt;
+      if(!collisionAt(new THREE.Vector3(player.pos.x, nextPos.y, player.pos.z))){
+        player.pos.y = nextPos.y;
+      } else {
+        if(player.velocity.y < 0) player.onGround = true;
+        player.velocity.y = 0;
+      }
+      // Z
+      nextPos.z += player.velocity.z * dt;
+      if(!collisionAt(new THREE.Vector3(player.pos.x, player.pos.y, nextPos.z))){
+        player.pos.z = nextPos.z;
+      } else {
+        player.velocity.z = 0;
+      }
+
+      // Camera follow
+      const eye = player.pos.clone();
+      if(eye.y < PLAYER_EYE) eye.y = PLAYER_EYE;
+      camera.position.set(eye.x, eye.y, eye.z);
+      const lookDir = new THREE.Vector3(
+        Math.sin(player.yaw) * Math.cos(player.pitch),
+        Math.sin(player.pitch),
+        Math.cos(player.yaw) * Math.cos(player.pitch)
+      );
+      camera.lookAt(eye.clone().add(lookDir));
+
+      // Interact: place/break using center ray & buttons or keys
+      // We debounced touches by resetting inputState.place/break on usage so one action per tap
+      if(inputState.place || inputState.break){
+        const tgt = getBlockTarget();
+        if(tgt){
+          const bx = tgt.block.x, by = tgt.block.y, bz = tgt.block.z;
+          const tx = tgt.target.x, ty = tgt.target.y, tz = tgt.target.z;
+          if(inputState.break){
+            world.set(bx,by,bz, BLOCK_AIR);
+            world.updateMesh();
+          }
+          if(inputState.place){
+            if(world.inBounds(tx,ty,tz) && world.get(tx,ty,tz) === BLOCK_AIR){
+              world.set(tx,ty,tz, BLOCK_DIRT);
+              world.updateMesh();
+            }
+          }
+        }
+        // clear action to prevent continuous place/break while holding
+        inputState.place = false;
+        inputState.break = false;
+      }
+
+      // Sun/day-night rotation
+      const t = now * 0.00012;
+      sun.position.set(50*Math.sin(t), 50*Math.cos(t), 20*Math.cos(t*0.7));
+
+      updateHUD();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    // Start loop
+    requestAnimationFrame(animate);
+
+    // Initial camera orientation & HUD
+    camera.position.set(player.pos.x, player.pos.y, player.pos.z);
+    camera.lookAt(player.pos.x + Math.sin(player.yaw), player.pos.y + Math.sin(player.pitch), player.pos.z + Math.cos(player.yaw));
+    const hudEl = document.getElementById('hud');
+    hudEl.innerHTML = "Loaded. Desktop: click to pointer-lock and use WASD. Mobile: use left joystick and right drag to look.";
+
+    // Expose joystick object to animate loop
+    (function exposeJoystickForLoop(){
+      // joystick variable is used directly in the loop; no need to expose globally
+    })();
+
+    // Finally: wire setupControls now that scene and player exist
+    setupControls(player, camera);
+
+    // Helpful note in console
+    console.log("Voxel game loaded — mobile and desktop controls enabled. To run locally, serve this file with a static HTTP server.");
+
+  </script>
+</body>
+</html>
